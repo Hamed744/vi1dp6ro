@@ -1,4 +1,5 @@
 # Dockerfile
+
 # Use an official Python runtime as a parent image
 FROM python:3.9-slim
 
@@ -21,5 +22,6 @@ RUN mkdir -p /app/tmp && chmod 777 /app/tmp
 # Expose the port the app runs on
 EXPOSE 7860
 
+# <<< تغییر کلیدی: بهینه سازی برای پردازش همزمان کاربران بیشتر >>>
 # Run app.py when the container launches
-CMD ["gunicorn", "--workers", "1", "--threads", "4", "--bind", "0.0.0.0:7860", "app:app"]
+CMD ["gunicorn", "--workers", "2", "--threads", "4", "--bind", "0.0.0.0:7860", "app:app"]
