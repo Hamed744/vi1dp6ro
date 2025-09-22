@@ -1,4 +1,4 @@
-# app.py (نسخه اصلاح شده و هوشمندتر)
+# app.py (نسخه نهایی، پایدار و بهینه شده)
 import os
 import json
 import time
@@ -30,10 +30,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 CORS(app)
 
-# --- مدیریت داده‌های کاربران ---
+# --- مدیریت داده‌های کاربران و قفل‌ها ---
 usage_data_cache = []
-cache_lock = threading.Lock()
-data_changed = threading.Event()
+cache_lock = threading.Lock() # قفل برای دسترسی به حافظه کش
+data_changed = threading.Event() # برای اطلاع از وجود تغییرات برای ذخیره
+persistence_lock = threading.Lock() # <<< تغییر کلیدی: قفل جدید برای اتمی کردن عملیات ذخیره‌سازی >>>
 api = None
 
 if not HF_TOKEN:
@@ -70,8 +71,15 @@ def load_initial_data():
                 )
                 with open(local_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-                    usage_data_cache = json.loads(content) if content else []
-                    logging.info(f"Loaded {len(usage_data_cache)} records from {DATASET_FILENAME}.")
+                    if content:
+                        usage_data_cache = json.loads(content)
+                        logging.info(f"Loaded {len(usage_data_cache)} records from {DATASET_FILENAME}.")
+                    else:
+                        usage_data_cache = []
+                        logging.info("Data file was empty. Initialized with an empty list.")
+        except json.JSONDecodeError:
+            logging.error(f"CRITICAL: Failed to decode JSON from '{DATASET_FILENAME}'. The file might be corrupted. Starting fresh.")
+            usage_data_cache = []
         except (RepositoryNotFoundError, EntryNotFoundError):
             logging.warning(f"Dataset file '{DATASET_FILENAME}' not found. A new one will be created.")
             usage_data_cache = []
@@ -80,35 +88,44 @@ def load_initial_data():
             usage_data_cache = []
 
 def persist_data_to_hub():
-    with cache_lock:
+    # <<< تغییر کلیدی: این تابع اکنون کاملاً Thread-Safe است >>>
+    # با استفاده از persistence_lock، تضمین می‌کنیم که فقط یک ترد در هر لحظه می‌تواند فایل را آپلود کند.
+    with persistence_lock:
         if not data_changed.is_set() or not api:
             return
-        data_to_write = list(usage_data_cache)
-        data_changed.clear() 
 
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=TEMP_DIR, delete=False, suffix='.json') as temp_f:
-        temp_filepath = temp_f.name
-        json.dump(data_to_write, temp_f, ensure_ascii=False, indent=2)
-    
-    try:
-        logging.info("Change detected, preparing to write to Hub...")
-        api.upload_file(
-            path_or_fileobj=temp_filepath,
-            path_in_repo=DATASET_FILENAME,
-            repo_id=DATASET_REPO,
-            repo_type="dataset",
-            commit_message="Update animation usage data"
-        )
-        logging.info(f"Successfully persisted {len(data_to_write)} records to Hub in {DATASET_FILENAME}.")
-    except Exception as e:
-        logging.error(f"CRITICAL: Failed to persist data to Hub: {e}", exc_info=True)
-        data_changed.set()
-    finally:
-        if os.path.exists(temp_filepath):
-            os.remove(temp_filepath)
+        with cache_lock:
+            # یک کپی از داده‌ها برای نوشتن ایجاد می‌کنیم تا قفل کش سریع آزاد شود
+            data_to_write = list(usage_data_cache)
+            data_changed.clear() 
+
+        temp_filepath = None
+        try:
+            # از یک فایل موقت برای نوشتن داده‌ها استفاده می‌کنیم
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=TEMP_DIR, delete=False, suffix='.json') as temp_f:
+                temp_filepath = temp_f.name
+                json.dump(data_to_write, temp_f, ensure_ascii=False, indent=2)
+            
+            logging.info("Change detected, preparing to write to Hub...")
+            api.upload_file(
+                path_or_fileobj=temp_filepath,
+                path_in_repo=DATASET_FILENAME,
+                repo_id=DATASET_REPO,
+                repo_type="dataset",
+                commit_message="Update animation usage data"
+            )
+            logging.info(f"Successfully persisted {len(data_to_write)} records to Hub.")
+        except Exception as e:
+            logging.error(f"CRITICAL: Failed to persist data to Hub: {e}", exc_info=True)
+            # اگر آپلود ناموفق بود، فلگ را دوباره ست می‌کنیم تا در تلاش بعدی ذخیره شود
+            data_changed.set()
+        finally:
+            if temp_filepath and os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
 
 def background_persister():
     while True:
+        # هر ۳۰ ثانیه، در صورت وجود تغییر، داده‌ها را ذخیره می‌کند
         time.sleep(30)
         persist_data_to_hub()
 
@@ -138,7 +155,6 @@ def enhance_animation_prompt():
         logging.error(f"Could not process uploaded image: {e}")
         return jsonify({"error": "Invalid or corrupt image file."}), 400
 
-    # ✅✅✅ شاه‌پرامپت جدید و بسیار هوشمندتر ✅✅✅
     gemini_master_prompt = f"""
 You are an expert AI Animation Planner. Your absolute highest priority is to faithfully and creatively execute the user's specific request. You are not just an artist; you are a technical problem solver.
 
@@ -210,11 +226,10 @@ Based on your decision, generate the following two keys in English.
             current_key_log_index = key_index
             key_index = (key_index + 1) % len(gemini_keys)
         
-        logging.info(f"Attempt {attempt + 1}/{max_retries}: Using Gemini key index {current_key_log_index}.")
-
+        # <<< تغییر کلیدی: لاگ‌های اضافی حذف شدند >>>
         try:
             genai.configure(api_key=current_key)
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            model = genai.GenerativeModel('gemini-1.5-flash') # Recommended model
             
             response = model.generate_content([gemini_master_prompt, img])
             
@@ -225,13 +240,14 @@ Based on your decision, generate the following two keys in English.
                 raise json.JSONDecodeError("No JSON object found in the response.", text_response, 0)
             
             cleaned_response = text_response[json_start:json_end]
-            logging.info(f"Gemini raw response (Key Index {current_key_log_index}): {cleaned_response}")
-            
             enhanced_prompts = json.loads(cleaned_response)
+
+            # <<< تغییر کلیدی: لاگ فقط در صورت موفقیت >>>
+            logging.info(f"Successfully got response from Gemini using key index {current_key_log_index}.")
             return jsonify(enhanced_prompts)
 
         except json.JSONDecodeError as e:
-            logging.warning(f"Key Index {current_key_log_index} failed (JSON Decode Error): {e}. Response was: {cleaned_response}")
+            logging.warning(f"Key Index {current_key_log_index} failed (JSON Decode Error). Response: {cleaned_response}. Error: {e}")
         except Exception as e:
             logging.warning(f"Key Index {current_key_log_index} failed with an API error: {e}")
 
@@ -294,18 +310,22 @@ def use_credit():
             usage_data_cache.append(user_record)
         
         credits_remaining = USAGE_LIMIT - user_record['count']
-        data_changed.set()
-
-    threading.Thread(target=persist_data_to_hub).start()
-    logging.info(f"Immediate persistence triggered for user {user_id}.")
+        data_changed.set() # <<< تغییر کلیدی: فقط فلگ را ست می‌کنیم. ترد پس‌زمینه کار ذخیره را انجام می‌دهد >>>
         
     return jsonify({"status": "success", "credits_remaining": credits_remaining})
 
 # --- اجرای برنامه ---
 if __name__ != '__main__':
-    load_initial_data()
-    persister_thread = threading.Thread(target=background_persister, daemon=True)
-    persister_thread.start()
+    # <<< تغییر کلیدی: افزایش پایداری در استارت‌آپ >>>
+    try:
+        load_initial_data()
+        persister_thread = threading.Thread(target=background_persister, daemon=True)
+        persister_thread.start()
+        logging.info("Application startup complete.")
+    except Exception as e:
+        logging.critical(f"A critical error occurred during application startup: {e}", exc_info=True)
+        # در محیط‌های پروداکشن، ممکن است بخواهید اینجا برنامه را متوقف کنید
+        # raise SystemExit(f"Startup failed: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 7860))
