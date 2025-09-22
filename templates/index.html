@@ -659,7 +659,7 @@
              * ✅✅✅ NEW: Wrapper for fetch with a timeout. ✅✅✅
              * This function prevents the app from getting stuck if the server is unresponsive.
              */
-            async function fetchWithTimeout(resource, options = {}, timeout = 60000) { // 60-second timeout
+            async function fetchWithTimeout(resource, options = {}, timeout = 90000) { // 90-second timeout
                 const controller = new AbortController();
                 const id = setTimeout(() => controller.abort(), timeout);
                 const response = await fetch(resource, {
